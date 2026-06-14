@@ -85,14 +85,31 @@ def create_app(api_key: str = "") -> FastAPI:
 
     # Serve the web dashboard at GET /
     import os
-    static_dir = os.path.join(os.path.dirname(__file__), "static")
-    if os.path.isdir(static_dir):
+    from pathlib import Path
+
+    # Try multiple locations so it works locally and in Docker
+    possible_dirs = [
+        os.path.join(os.path.dirname(__file__), "static"),
+        os.path.join(os.getcwd(), "driftctl", "api", "static"),
+        "/app/driftctl/api/static",
+    ]
+    static_dir = None
+    for d in possible_dirs:
+        if os.path.isdir(d):
+            static_dir = d
+            break
+
+    if static_dir:
         @application.get("/", include_in_schema=False)
         async def dashboard():
             index = os.path.join(static_dir, "index.html")
             if os.path.exists(index):
                 return FileResponse(index)
-            return {"message": "Dashboard not found"}
+            return {"message": f"Dashboard not found. Looked in: {static_dir}"}
+    else:
+        @application.get("/", include_in_schema=False)
+        async def dashboard_missing():
+            return {"message": "Dashboard static dir not found", "tried": possible_dirs}
 
     return application
 

@@ -1,0 +1,1 @@
+open('Dockerfile','w').write(open('create_dockerfile.py').read())
