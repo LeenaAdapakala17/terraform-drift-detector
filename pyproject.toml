@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "driftctl"
+version = "1.0.0"
+description = "Terraform drift detector"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3",
+    "typer",
+    "rich",
+    "pyyaml",
+    "fastapi",
+    "uvicorn",
+    "apscheduler",
+]
+
+[project.scripts]
+driftctl = "driftctl.cli:app"
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "moto[ec2,s3]",
+    "httpx",
+    "pre-commit",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["driftctl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
