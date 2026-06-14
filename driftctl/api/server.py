@@ -40,6 +40,12 @@ async def _lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Scheduler could not start: %s", exc)
 
+    # Auto-create demo workspace pointing to the bundled sample tfstate
+    try:
+        _seed_demo_workspace()
+    except Exception as exc:
+        logger.warning("Could not seed demo workspace: %s", exc)
+
     yield
 
     # Shutdown
@@ -49,6 +55,89 @@ async def _lifespan(app: FastAPI):
     except Exception:
         pass
     logger.info("driftctl server stopped")
+
+
+def _seed_demo_workspace() -> None:
+    """
+    Create a demo workspace on first startup using the bundled sample.tfstate.
+    This lets anyone visiting the deployed app click Scan Now immediately.
+    Uses skip-cloud mode so no AWS credentials are needed for the demo.
+    """
+    import os
+    from pathlib import Path
+    from driftctl.storage.db import get_workspace_by_name, save_workspace
+
+    # Already exists — don't recreate
+    if get_workspace_by_name("demo"):
+        return
+
+    # Find the sample tfstate bundled with the app
+    possible_paths = [
+        Path(__file__).parent.parent.parent / "testdata" / "sample.tfstate",
+        Path("/app/testdata/sample.tfstate"),
+        Path("testdata/sample.tfstate"),
+    ]
+    state_path = None
+    for p in possible_paths:
+        if p.exists():
+            state_path = str(p)
+            break
+
+    if not state_path:
+        logger.warning("sample.tfstate not found, skipping demo workspace creation")
+        return
+
+    save_workspace(
+        name="demo",
+        state_path=state_path,
+        region="us-east-1",
+        state_backend="local",
+        detect_unmanaged=False,
+    )
+    logger.info("Demo workspace created with state: %s", state_path)
+
+    # Run an initial demo scan immediately (skip-cloud so no AWS needed)
+    try:
+        _run_demo_scan(state_path)
+    except Exception as exc:
+        logger.warning("Initial demo scan failed: %s", exc)
+
+
+def _run_demo_scan(state_path: str) -> None:
+    """Run a skip-cloud scan against the sample tfstate and save results."""
+    import uuid
+    from datetime import datetime, timezone
+    from driftctl.engine.drift import detect_drift
+    from driftctl.engine.remediate import enrich_results
+    from driftctl.models import ScanReport
+    from driftctl.state.extractor import extract_from_state
+    from driftctl.state.reader import read_state
+    from driftctl.storage.db import save_scan
+
+    raw_records = read_state(state_path)
+    expected = [
+        r for r in (
+            extract_from_state(rec["type"], rec["name"], rec["attributes"])
+            for rec in raw_records
+        )
+        if r is not None
+    ]
+
+    # skip-cloud: actual = [] so all resources show as MISSING
+    # This demonstrates the tool working without needing AWS credentials
+    results = detect_drift(expected, [], detect_unmanaged=False)
+    enrich_results(results)
+
+    report = ScanReport(
+        scan_id=str(uuid.uuid4()),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        state_path=state_path,
+        region="us-east-1",
+        workspace="demo",
+        results=results,
+    )
+    save_scan(report)
+    logger.info("Demo scan complete: %d results", len(results))
 
 
 def create_app(api_key: str = "") -> FastAPI:

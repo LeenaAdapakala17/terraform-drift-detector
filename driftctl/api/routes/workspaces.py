@@ -209,13 +209,28 @@ def _create_pending_scan(
 
 
 def _run_scan_background(ws: dict, scan_id: str) -> None:
-    """Run the full scan pipeline and update the scan row when done."""
-    from driftctl.scheduler.jobs import _execute_scan
+    """
+    Run the full scan pipeline and update the scan row when done.
+    Uses skip-cloud mode when AWS credentials are not available,
+    so the demo workspace works for everyone without AWS access.
+    """
     from driftctl.storage.db import _connect
+    import os
+
     try:
-        # Run scan — _execute_scan saves its own scan row;
-        # update our placeholder row with the result
-        _execute_scan(ws)
+        # Check if AWS credentials are available
+        has_creds = bool(
+            os.environ.get("AWS_ACCESS_KEY_ID") or
+            os.environ.get("AWS_PROFILE")
+        )
+
+        if has_creds:
+            from driftctl.scheduler.jobs import _execute_scan
+            _execute_scan(ws)
+        else:
+            # No AWS credentials — run in skip-cloud mode
+            _execute_scan_skip_cloud(ws)
+
         status = "complete"
         error_msg = None
     except Exception as exc:
@@ -228,3 +243,48 @@ def _run_scan_background(ws: dict, scan_id: str) -> None:
             (status, error_msg, scan_id),
         )
         conn.commit()
+
+
+def _execute_scan_skip_cloud(ws: dict) -> None:
+    """
+    Run a scan in skip-cloud mode (no AWS calls).
+    Compares state against an empty actual model — all resources
+    appear as MISSING, demonstrating the detection pipeline.
+    """
+    import uuid
+    from datetime import datetime, timezone
+    from driftctl.engine.drift import detect_drift
+    from driftctl.engine.remediate import enrich_results
+    from driftctl.models import ScanReport
+    from driftctl.state.extractor import extract_from_state
+    from driftctl.state.reader import read_state
+    from driftctl.storage.db import save_scan
+
+    state_path = ws.get("state_path", "")
+    region = ws.get("region", "us-east-1")
+
+    raw_records = read_state(state_path, region=region)
+    expected = [
+        r for r in (
+            extract_from_state(rec["type"], rec["name"], rec["attributes"])
+            for rec in raw_records
+        )
+        if r is not None
+    ]
+
+    # Skip cloud fetch — actual is empty
+    results = detect_drift(
+        expected, [],
+        detect_unmanaged=bool(ws.get("detect_unmanaged", False)),
+    )
+    enrich_results(results)
+
+    report = ScanReport(
+        scan_id=str(uuid.uuid4()),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        state_path=state_path,
+        region=region,
+        workspace=ws.get("name"),
+        results=results,
+    )
+    save_scan(report)
