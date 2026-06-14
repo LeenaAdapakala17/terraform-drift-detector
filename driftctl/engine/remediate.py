@@ -194,18 +194,25 @@ def _suggested_name(result: DriftResult) -> str:
 def _format_value(value: object) -> str:
     """
     Format a value for display in a remediation hint comment.
-    Keeps it concise — long lists are truncated.
+    SGRule dataclasses are rendered as clean readable dicts.
     """
     if value is None:
         return "null"
     if isinstance(value, bool):
         return str(value).lower()
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         if len(value) == 0:
             return "[]"
-        if len(value) > 3:
-            return f"[{value[0]!r}, ... ({len(value)} items)]"
-        return str(value)
+        items = [_format_value(v) for v in list(value)[:3]]
+        suffix = f" ...+{len(value)-3} more" if len(value) > 3 else ""
+        return f"[{', '.join(items)}{suffix}]"
     if isinstance(value, str):
         return f'"{value}"'
+    if hasattr(value, "__dataclass_fields__"):
+        parts = []
+        for f in value.__dataclass_fields__:
+            v = getattr(value, f)
+            if v or v == 0:
+                parts.append(f"{f}={_format_value(v)}")
+        return "{" + ", ".join(parts) + "}"
     return str(value)
