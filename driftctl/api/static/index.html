@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>driftctl — Terraform Drift Detector</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:#0f1117; --surface:#1a1d27; --border:#2a2d3a; --text:#e2e8f0;
+    --muted:#64748b; --accent:#6366f1; --accent-h:#818cf8;
+    --missing:#ef4444; --unmanaged:#f59e0b; --modified:#06b6d4;
+    --tag:#8b5cf6; --insync:#22c55e; --radius:8px; --shadow:0 4px 24px rgba(0,0,0,0.4);
+  }
+  body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif; font-size:14px; line-height:1.6; min-height:100vh; }
+  .shell { display:flex; min-height:100vh; }
+  .sidebar { width:220px; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:20px 0; position:fixed; top:0; bottom:0; left:0; z-index:100; }
+  .sidebar .logo { padding:0 20px 20px; border-bottom:1px solid var(--border); font-size:16px; font-weight:700; color:var(--accent-h); }
+  .sidebar .logo span { color:var(--muted); font-weight:400; font-size:11px; display:block; margin-top:2px; }
+  .nav { padding:12px 0; flex:1; }
+  .nav-item { display:flex; align-items:center; gap:10px; padding:10px 20px; cursor:pointer; color:var(--muted); border-left:3px solid transparent; transition:all 0.15s; font-size:13px; }
+  .nav-item:hover { color:var(--text); background:rgba(99,102,241,0.08); }
+  .nav-item.active { color:var(--accent-h); border-left-color:var(--accent); background:rgba(99,102,241,0.12); }
+  .nav-item .icon { font-size:16px; width:20px; text-align:center; }
+  .main { margin-left:220px; flex:1; padding:28px 32px; max-width:1200px; }
+  .page-header { margin-bottom:24px; }
+  .page-header h1 { font-size:20px; font-weight:600; }
+  .page-header p  { color:var(--muted); font-size:13px; margin-top:4px; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; box-shadow:var(--shadow); }
+  .card-title { font-size:13px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:0.6px; margin-bottom:16px; }
+  .grid-4 { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:24px; }
+  .grid-2 { display:grid; grid-template-columns:repeat(2,1fr); gap:16px; }
+  .stat-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:18px 20px; }
+  .stat-card .label { font-size:12px; color:var(--muted); margin-bottom:6px; }
+  .stat-card .value { font-size:28px; font-weight:700; }
+  .stat-card.missing .value   { color:var(--missing); }
+  .stat-card.unmanaged .value { color:var(--unmanaged); }
+  .stat-card.modified .value  { color:var(--modified); }
+  .stat-card.tagdrift .value  { color:var(--tag); }
+  .ws-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:18px; display:flex; flex-direction:column; gap:10px; }
+  .ws-name { font-weight:600; font-size:15px; }
+  .ws-meta { font-size:12px; color:var(--muted); }
+  .ws-state { font-size:11px; color:var(--muted); font-family:monospace; word-break:break-all; }
+  .btn { display:inline-flex; align-items:center; gap:6px; padding:7px 14px; border-radius:6px; border:none; cursor:pointer; font-size:12px; font-weight:500; transition:all 0.15s; }
+  .btn-primary { background:var(--accent); color:#fff; }
+  .btn-primary:hover { background:var(--accent-h); }
+  .btn-ghost { background:transparent; color:var(--muted); border:1px solid var(--border); }
+  .btn-ghost:hover { color:var(--text); border-color:var(--accent); }
+  .btn:disabled { opacity:0.5; cursor:not-allowed; }
+  .btn-sm { padding:4px 10px; font-size:11px; }
+  .btn-copy { background:rgba(99,102,241,0.15); color:var(--accent-h); border:1px solid rgba(99,102,241,0.3); }
+  .badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; }
+  .badge-MISSING   { background:rgba(239,68,68,0.15);   color:var(--missing); }
+  .badge-UNMANAGED { background:rgba(245,158,11,0.15);  color:var(--unmanaged); }
+  .badge-MODIFIED  { background:rgba(6,182,212,0.15);   color:var(--modified); }
+  .badge-TAG_DRIFT { background:rgba(139,92,246,0.15);  color:var(--tag); }
+  .badge-IN_SYNC   { background:rgba(34,197,94,0.15);   color:var(--insync); }
+  .badge-running   { background:rgba(99,102,241,0.15);  color:var(--accent-h); }
+  .badge-complete  { background:rgba(34,197,94,0.15);   color:var(--insync); }
+  .badge-error     { background:rgba(239,68,68,0.15);   color:var(--missing); }
+  .tbl { width:100%; border-collapse:collapse; }
+  .tbl th { text-align:left; padding:10px 12px; font-size:11px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; border-bottom:1px solid var(--border); }
+  .tbl td { padding:11px 12px; border-bottom:1px solid rgba(42,45,58,0.6); font-size:13px; vertical-align:top; }
+  .tbl tr:last-child td { border-bottom:none; }
+  .tbl tr.clickable { cursor:pointer; }
+  .tbl tr.clickable:hover td { background:rgba(99,102,241,0.06); }
+  .mono { font-family:monospace; font-size:12px; color:var(--muted); }
+  .drill-section { padding:16px 18px; border-bottom:1px solid var(--border); }
+  .drill-section:last-child { border-bottom:none; }
+  .drill-label { font-size:11px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:10px; }
+  .diff-row { display:grid; grid-template-columns:180px 1fr 1fr; gap:8px; padding:6px 0; border-bottom:1px solid rgba(42,45,58,0.4); font-size:12px; }
+  .diff-row:last-child { border-bottom:none; }
+  .diff-field    { color:var(--muted); font-family:monospace; }
+  .diff-expected { color:var(--insync); font-family:monospace; word-break:break-all; }
+  .diff-actual   { color:var(--missing); font-family:monospace; word-break:break-all; }
+  .remediation-block { background:rgba(0,0,0,0.3); border-radius:6px; padding:12px 14px 12px 14px; font-family:monospace; font-size:12px; white-space:pre-wrap; color:#94a3b8; line-height:1.7; position:relative; }
+  .copy-btn { position:absolute; top:8px; right:8px; }
+  .chart-wrap { overflow-x:auto; }
+  .spinner { width:14px; height:14px; border:2px solid rgba(99,102,241,0.3); border-top-color:var(--accent-h); border-radius:50%; animation:spin 0.7s linear infinite; display:inline-block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .empty { text-align:center; color:var(--muted); padding:40px; font-size:13px; }
+  .loading { text-align:center; padding:40px; }
+  .chip { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:rgba(99,102,241,0.12); border-radius:20px; font-size:11px; color:var(--accent-h); font-family:monospace; }
+  .back { display:inline-flex; align-items:center; gap:6px; color:var(--muted); cursor:pointer; font-size:13px; margin-bottom:20px; }
+  .back:hover { color:var(--text); }
+  .text-muted { color:var(--muted); }
+  .text-sm { font-size:12px; }
+  .mt-24 { margin-top:24px; }
+  .separator { border:none; border-top:1px solid var(--border); margin:20px 0; }
+  .hidden { display:none !important; }
+  ::-webkit-scrollbar { width:6px; height:6px; }
+  ::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="sidebar">
+    <div class="logo">driftctl<span>terraform drift detector</span></div>
+    <div class="nav">
+      <div class="nav-item active" data-view="home" onclick="nav('home')"><span class="icon">🏠</span> Dashboard</div>
+      <div class="nav-item" data-view="scans" onclick="nav('scans')"><span class="icon">📋</span> Scan History</div>
+      <div class="nav-item" data-view="trends" onclick="nav('trends')"><span class="icon">📈</span> Trends</div>
+    </div>
+  </nav>
+  <main class="main">
+
+    <!-- HOME -->
+    <div id="view-home">
+      <div class="page-header"><h1>Dashboard</h1><p>Live drift status across all workspaces</p></div>
+      <div class="grid-4" id="stat-grid">
+        <div class="stat-card missing"><div class="label">MISSING</div><div class="value" id="stat-missing">—</div></div>
+        <div class="stat-card unmanaged"><div class="label">UNMANAGED</div><div class="value" id="stat-unmanaged">—</div></div>
+        <div class="stat-card modified"><div class="label">MODIFIED</div><div class="value" id="stat-modified">—</div></div>
+        <div class="stat-card tagdrift"><div class="label">TAG DRIFT</div><div class="value" id="stat-tag">—</div></div>
+      </div>
+      <div class="card"><div class="card-title">Workspaces</div><div id="workspace-list"><div class="loading"><span class="spinner"></span></div></div></div>
+      <div class="card mt-24"><div class="card-title">Recent Scans</div><div id="recent-scans"><div class="loading"><span class="spinner"></span></div></div></div>
+    </div>
+
+    <!-- SCAN HISTORY -->
+    <div id="view-scans" class="hidden">
+      <div class="page-header"><h1>Scan History</h1><p>All scans, newest first</p></div>
+      <div class="card"><div id="scan-history"><div class="loading"><span class="spinner"></span></div></div></div>
+    </div>
+
+    <!-- SCAN DETAIL -->
+    <div id="view-detail" class="hidden">
+      <div class="back" onclick="nav(_prev||'scans')">← Back</div>
+      <div id="detail-content"><div class="loading"><span class="spinner"></span></div></div>
+    </div>
+
+    <!-- TRENDS -->
+    <div id="view-trends" class="hidden">
+      <div class="page-header"><h1>Drift Trends</h1><p>Drifted resource count over time</p></div>
+      <div style="display:flex;gap:8px;margin-bottom:16px">
+        <button class="btn btn-ghost btn-sm" id="tw-7"  onclick="setW(7)">7 days</button>
+        <button class="btn btn-primary btn-sm" id="tw-30" onclick="setW(30)">30 days</button>
+        <button class="btn btn-ghost btn-sm" id="tw-90" onclick="setW(90)">90 days</button>
+      </div>
+      <div class="card"><div id="trends-wrap"><div class="loading"><span class="spinner"></span></div></div></div>
+    </div>
+
+  </main>
+</div>
+<script>
+const API=''; let _cur='home',_prev=null,_tw=30;
+
+function nav(v,p={}){
+  document.querySelectorAll('.nav-item').forEach(e=>e.classList.toggle('active',e.dataset.view===v));
+  ['home','scans','detail','trends'].forEach(n=>document.getElementById('view-'+n).classList.toggle('hidden',n!==v));
+  if(v!=='detail') _prev=_cur; _cur=v;
+  if(v==='home')   loadHome();
+  if(v==='scans')  loadScans();
+  if(v==='detail') loadDetail(p.id);
+  if(v==='trends') loadTrends();
+}
+
+async function api(path){
+  const r=await fetch(API+path); const j=await r.json(); return j.data??j;
+}
+
+// HOME
+async function loadHome(){
+  const [wss,scans]=await Promise.all([api('/api/v1/workspaces'),api('/api/v1/scans?limit=50')]);
+  const latestByWs={};
+  scans.forEach(s=>{if(s.workspace&&!latestByWs[s.workspace])latestByWs[s.workspace]=s;});
+  let m=0,u=0,mod=0,t=0;
+  Object.values(latestByWs).forEach(s=>{const sm=parseSm(s.summary_json);m+=sm.missing||0;u+=sm.unmanaged||0;mod+=sm.modified||0;t+=sm.tag_drift||0;});
+  document.getElementById('stat-missing').textContent=m;
+  document.getElementById('stat-unmanaged').textContent=u;
+  document.getElementById('stat-modified').textContent=mod;
+  document.getElementById('stat-tag').textContent=t;
+  const wEl=document.getElementById('workspace-list');
+  if(!wss.length){wEl.innerHTML='<div class="empty">No workspaces. Create one via CLI or API.</div>';}
+  else{
+    wEl.innerHTML=`<div class="grid-2">${wss.map(ws=>{
+      const l=latestByWs[ws.name]; const dc=l?.drifted_count??'—';
+      return`<div class="ws-card">
+        <div style="display:flex;justify-content:space-between">
+          <div><div class="ws-name">${esc(ws.name)}</div><div class="ws-meta">${esc(ws.provider)} · ${esc(ws.region)}</div></div>
+          <div style="text-align:right">${l?`<div style="font-size:22px;font-weight:700;color:${dc>0?'var(--missing)':'var(--insync)'}">${dc}</div><div class="text-sm text-muted">drifted</div>`:'<div class="text-muted text-sm">no scans</div>'}</div>
+        </div>
+        <div class="ws-state">${esc(ws.state_path)}</div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          ${ws.schedule_cron?`<span class="chip">⏰ ${esc(ws.schedule_cron)}</span>`:'<span class="text-muted text-sm">no schedule</span>'}
+          <button class="btn btn-primary btn-sm" id="sb-${ws.id}" onclick="triggerScan('${ws.id}','${esc(ws.name)}')">▶ Scan Now</button>
+        </div>
+        ${l?`<div class="text-sm text-muted">Last: ${ago(l.created_at)}</div>`:''}
+      </div>`;}).join('')}</div>`;
+  }
+  const rEl=document.getElementById('recent-scans');
+  if(!scans.length){rEl.innerHTML='<div class="empty">No scans yet.</div>';return;}
+  rEl.innerHTML=`<table class="tbl"><thead><tr><th>Scan ID</th><th>Workspace</th><th>Drifted</th><th>Status</th><th>When</th></tr></thead><tbody>
+    ${scans.slice(0,10).map(s=>`<tr class="clickable" onclick="openDetail('${s.scan_id}','home')">
+      <td class="mono">${s.scan_id.slice(0,8)}…</td>
+      <td>${s.workspace?esc(s.workspace):'<span class="text-muted">—</span>'}</td>
+      <td style="font-weight:600;color:${(s.drifted_count||0)>0?'var(--missing)':'var(--insync)'}">${s.drifted_count??'—'}</td>
+      <td><span class="badge badge-${s.status||'complete'}">${s.status||'complete'}</span></td>
+      <td class="text-muted">${ago(s.created_at)}</td></tr>`).join('')}
+  </tbody></table>`;
+}
+
+async function triggerScan(id,name){
+  const btn=document.getElementById('sb-'+id);
+  btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+  try{
+    const r=await fetch(`${API}/api/v1/workspaces/${id}/scans`,{method:'POST'});
+    const j=await r.json(); const sid=j.data?.scan_id;
+    if(sid) poll(sid,id);
+  }catch(e){btn.disabled=false;btn.innerHTML='▶ Scan Now';}
+}
+function poll(sid,wid){
+  const t=setInterval(async()=>{
+    try{const s=await api(`/api/v1/scans/${sid}/summary`);
+    if(s.status==='complete'||s.status==='error'){
+      clearInterval(t);
+      const btn=document.getElementById('sb-'+wid);
+      if(btn){btn.disabled=false;btn.innerHTML='▶ Scan Now';}
+      loadHome();
+    }}catch(_){clearInterval(t);}
+  },3000);
+}
+
+// SCAN HISTORY
+async function loadScans(){
+  const scans=await api('/api/v1/scans?limit=100');
+  const el=document.getElementById('scan-history');
+  if(!scans.length){el.innerHTML='<div class="empty">No scans yet.</div>';return;}
+  el.innerHTML=`<table class="tbl"><thead><tr><th>Scan ID</th><th>Workspace</th><th>State</th><th>Drifted</th><th>Total</th><th>Status</th><th>When</th></tr></thead><tbody>
+    ${scans.map(s=>`<tr class="clickable" onclick="openDetail('${s.scan_id}','scans')">
+      <td class="mono">${s.scan_id.slice(0,8)}…</td>
+      <td>${s.workspace?esc(s.workspace):'<span class="text-muted">—</span>'}</td>
+      <td class="mono" style="max-width:160px;overflow:hidden;text-overflow:ellipsis">${esc(s.state_path)}</td>
+      <td style="font-weight:600;color:${(s.drifted_count||0)>0?'var(--missing)':'var(--insync)'}">${s.drifted_count??'—'}</td>
+      <td class="text-muted">${s.total_resources??'—'}</td>
+      <td><span class="badge badge-${s.status||'complete'}">${s.status||'complete'}</span></td>
+      <td class="text-muted">${ago(s.created_at)}</td></tr>`).join('')}
+  </tbody></table>`;
+}
+
+// SCAN DETAIL ★
+function openDetail(id,from){_prev=from;nav('detail',{id});}
+async function loadDetail(id){
+  const el=document.getElementById('detail-content');
+  el.innerHTML='<div class="loading"><span class="spinner"></span></div>';
+  const data=await api(`/api/v1/scans/${id}/report?format=json`);
+  if(!data||!data.results){el.innerHTML='<div class="empty">Report not found.</div>';return;}
+  const s=data.summary; const drifted=data.results.filter(r=>r.status!=='IN_SYNC');
+  el.innerHTML=`
+  <div class="card" style="margin-bottom:20px">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px">
+      <div><div class="text-muted text-sm">Scan ID</div><div class="mono" style="font-size:11px">${esc(data.scan_id)}</div></div>
+      <div><div class="text-muted text-sm">State</div><div class="mono" style="font-size:11px;word-break:break-all">${esc(data.state_path)}</div></div>
+      <div><div class="text-muted text-sm">Region</div><div>${esc(data.region)}</div></div>
+      <div><div class="text-muted text-sm">Scanned</div><div>${ago(data.created_at)}</div></div>
+    </div>
+    <hr class="separator">
+    <div style="display:flex;gap:20px;align-items:center">
+      <div><span style="font-size:20px;font-weight:700;color:var(--missing)">${s.missing}</span> <span class="text-muted text-sm">MISSING</span></div>
+      <div><span style="font-size:20px;font-weight:700;color:var(--unmanaged)">${s.unmanaged}</span> <span class="text-muted text-sm">UNMANAGED</span></div>
+      <div><span style="font-size:20px;font-weight:700;color:var(--modified)">${s.modified}</span> <span class="text-muted text-sm">MODIFIED</span></div>
+      <div><span style="font-size:20px;font-weight:700;color:var(--tag)">${s.tag_drift}</span> <span class="text-muted text-sm">TAG DRIFT</span></div>
+      <div style="margin-left:auto"><button class="btn btn-ghost btn-sm" onclick="window.open('${API}/api/v1/scans/${esc(data.scan_id)}/report?format=json','_blank')">⬇ JSON</button></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">${drifted.length} Drifted Resource${drifted.length!==1?'s':''}</div>
+    ${drifted.length===0?'<div class="empty">All resources in sync.</div>':`
+    <table class="tbl"><thead><tr><th>Type</th><th>ID</th><th>Name</th><th>Status</th><th>Fields</th><th></th></tr></thead>
+    <tbody>${drifted.map((r,i)=>`
+      <tr class="clickable" onclick="toggleDrill(${i})">
+        <td>${esc(r.type)}</td><td class="mono">${esc(r.id)}</td>
+        <td class="text-muted">${r.name?esc(r.name):'—'}</td>
+        <td><span class="badge badge-${r.status}">${r.status}</span></td>
+        <td class="text-muted text-sm">${changedF(r)}</td>
+        <td><span id="arr-${i}" style="color:var(--muted)">▶</span></td>
+      </tr>
+      <tr id="dr-${i}" style="display:none"><td colspan="6" style="padding:0 0 12px 0">${buildPanel(r)}</td></tr>
+    `).join('')}</tbody></table>`}
+  </div>`;
+  window._res=drifted;
+}
+
+function toggleDrill(i){
+  const row=document.getElementById('dr-'+i); const open=row.style.display!=='none';
+  document.querySelectorAll('[id^="dr-"]').forEach(e=>e.style.display='none');
+  document.querySelectorAll('[id^="arr-"]').forEach(e=>e.textContent='▶');
+  if(!open){row.style.display='';document.getElementById('arr-'+i).textContent='▼';}
+}
+
+function buildPanel(r){
+  const ad=r.attribute_diffs||{}, td=r.tag_diffs||{};
+  let h='<div style="background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);margin:0 12px">';
+  if(Object.keys(ad).length){
+    h+=`<div class="drill-section"><div class="drill-label">Attribute Changes</div>
+    <div style="display:grid;grid-template-columns:180px 1fr 1fr;gap:8px;margin-bottom:6px">
+      <div class="text-muted text-sm" style="font-weight:600">Field</div>
+      <div style="color:var(--insync);font-size:11px;font-weight:600">EXPECTED</div>
+      <div style="color:var(--missing);font-size:11px;font-weight:600">ACTUAL</div>
+    </div>
+    ${Object.entries(ad).map(([f,d])=>`<div class="diff-row"><div class="diff-field">${esc(f)}</div><div class="diff-expected">${fmtV(d.expected)}</div><div class="diff-actual">${fmtV(d.actual)}</div></div>`).join('')}
+    </div>`;
+  }
+  if(Object.keys(td).length){
+    h+=`<div class="drill-section"><div class="drill-label">Tag Changes</div>
+    <div style="display:grid;grid-template-columns:180px 1fr 1fr;gap:8px;margin-bottom:6px">
+      <div class="text-muted text-sm" style="font-weight:600">Tag Key</div>
+      <div style="color:var(--insync);font-size:11px;font-weight:600">EXPECTED</div>
+      <div style="color:var(--missing);font-size:11px;font-weight:600">ACTUAL</div>
+    </div>
+    ${Object.entries(td).map(([k,d])=>`<div class="diff-row"><div class="diff-field">${esc(k)}</div><div class="diff-expected">${d.expected??'<span class="text-muted">—</span>'}</div><div class="diff-actual">${d.actual??'<span class="text-muted">—</span>'}</div></div>`).join('')}
+    </div>`;
+  }
+  if(r.remediation){
+    const rid='rem_'+r.id.replace(/[^a-z0-9]/gi,'_');
+    h+=`<div class="drill-section"><div class="drill-label">Remediation ★</div>
+    <div class="remediation-block" id="${rid}">${esc(r.remediation)}
+      <button class="btn btn-copy btn-sm copy-btn" onclick="copyRem(this,${JSON.stringify(r.remediation)})">📋 Copy</button>
+    </div></div>`;
+  }
+  return h+'</div>';
+}
+
+function copyRem(btn,text){
+  navigator.clipboard.writeText(text).then(()=>{btn.textContent='✓ Copied';setTimeout(()=>{btn.innerHTML='📋 Copy';},2000);});
+}
+
+function changedF(r){
+  const f=Object.keys(r.attribute_diffs||{});
+  if(Object.keys(r.tag_diffs||{}).length)f.push('tags');
+  return f.length?f.slice(0,3).join(', ')+(f.length>3?'…':''):'—';
+}
+
+// TRENDS ★
+function setW(d){
+  _tw=d; ['7','30','90'].forEach(n=>{
+    const b=document.getElementById('tw-'+n);
+    b.className='btn btn-sm '+(n==d?'btn-primary':'btn-ghost');
+  }); loadTrends();
+}
+
+async function loadTrends(){
+  const el=document.getElementById('trends-wrap');
+  el.innerHTML='<div class="loading"><span class="spinner"></span></div>';
+  const scans=await api('/api/v1/scans?limit=200');
+  if(!scans.length){el.innerHTML='<div class="empty">No scan history yet.</div>';return;}
+  const cut=new Date(); cut.setDate(cut.getDate()-_tw);
+  const filtered=scans.filter(s=>new Date(s.created_at)>=cut);
+  if(!filtered.length){el.innerHTML=`<div class="empty">No scans in the last ${_tw} days.</div>`;return;}
+  const byWs={};
+  filtered.forEach(s=>{const k=s.workspace||'(ad-hoc)';if(!byWs[k])byWs[k]=[];byWs[k].push({d:new Date(s.created_at),c:s.drifted_count||0});});
+  el.innerHTML=renderChart(byWs);
+}
+
+function renderChart(byWs){
+  const W=860,H=260,PL=44,PR=12,PT=14,PB=32,cW=W-PL-PR,cH=H-PT-PB;
+  const all=Object.values(byWs).flat();
+  const minD=new Date(Math.min(...all.map(p=>p.d)));
+  const maxD=new Date(Math.max(...all.map(p=>p.d)));
+  const span=Math.max(maxD-minD,1);
+  const maxC=Math.max(...all.map(p=>p.c),1);
+  const cols=['#6366f1','#06b6d4','#f59e0b','#22c55e','#ef4444','#8b5cf6'];
+  const xOf=d=>PL+((d-minD)/span)*cW;
+  const yOf=c=>PT+cH-(c/maxC)*cH;
+  const yticks=[0,Math.ceil(maxC/2),maxC];
+  const sorted=all.sort((a,b)=>a.d-b.d);
+  const step=Math.max(1,Math.ceil(sorted.length/6));
+  const xticks=[];
+  sorted.filter((_,i)=>i%step===0||i===sorted.length-1).forEach(p=>{if(!xticks.find(d=>Math.abs(d-p.d)<3600000))xticks.push(p.d);});
+  let svg=`<div class="chart-wrap"><svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:${W}px;height:${H}px"><style>text{font-family:system-ui,sans-serif;fill:#64748b}</style>
+  ${yticks.map(c=>`<line x1="${PL}" y1="${yOf(c).toFixed(1)}" x2="${W-PR}" y2="${yOf(c).toFixed(1)}" stroke="#2a2d3a" stroke-width="1"/>
+  <text x="${PL-6}" y="${(yOf(c)+4).toFixed(1)}" text-anchor="end" font-size="11">${c}</text>`).join('')}
+  ${xticks.map(d=>`<text x="${xOf(d).toFixed(1)}" y="${H-4}" text-anchor="middle" font-size="11">${(d.getMonth()+1)}/${d.getDate()}</text>`).join('')}
+  ${Object.entries(byWs).map(([ws,pts],wi)=>{
+    const col=cols[wi%cols.length];
+    const s=[...pts].sort((a,b)=>a.d-b.d);
+    if(s.length<2)return`<circle cx="${xOf(s[0].d).toFixed(1)}" cy="${yOf(s[0].c).toFixed(1)}" r="4" fill="${col}"/>`;
+    const path=s.map((p,i)=>`${i===0?'M':'L'}${xOf(p.d).toFixed(1)},${yOf(p.c).toFixed(1)}`).join(' ');
+    return`<path d="${path}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    ${s.map(p=>`<circle cx="${xOf(p.d).toFixed(1)}" cy="${yOf(p.c).toFixed(1)}" r="3.5" fill="${col}" stroke="#0f1117" stroke-width="1.5"><title>${esc(ws)}: ${p.c} drifted</title></circle>`).join('')}`;
+  }).join('')}
+  <line x1="${PL}" y1="${PT}" x2="${PL}" y2="${PT+cH}" stroke="#2a2d3a" stroke-width="1"/>
+  <line x1="${PL}" y1="${PT+cH}" x2="${W-PR}" y2="${PT+cH}" stroke="#2a2d3a" stroke-width="1"/>
+  </svg></div>
+  <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:12px">
+  ${Object.keys(byWs).map((ws,i)=>`<div style="display:flex;align-items:center;gap:6px"><div style="width:12px;height:12px;border-radius:3px;background:${cols[i%cols.length]}"></div><span style="font-size:12px;color:#94a3b8">${esc(ws)}</span></div>`).join('')}
+  </div>`;
+  return svg;
+}
+
+// UTILS
+function esc(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function fmtV(v){if(v===null||v===undefined)return'<span class="text-muted">null</span>';if(Array.isArray(v)){if(!v.length)return'[]';return'['+v.slice(0,3).map(i=>esc(JSON.stringify(i))).join(', ')+(v.length>3?'…':'')+']';}return esc(String(v));}
+function ago(iso){if(!iso)return'—';const m=Math.floor((Date.now()-new Date(iso))/60000);if(m<1)return'just now';if(m<60)return m+'m ago';const h=Math.floor(m/60);if(h<24)return h+'h ago';return Math.floor(h/24)+'d ago';}
+function parseSm(j){try{return JSON.parse(j)||{};}catch{return{};}}
+
+setInterval(()=>{if(_cur==='home')loadHome();},30000);
+loadHome();
+</script>
+</body>
+</html>

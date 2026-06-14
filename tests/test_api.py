@@ -379,3 +379,32 @@ class TestApiKeyAuth:
     def test_health_always_public(self, client_with_key):
         resp = client_with_key.get("/health")
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# GET / — web dashboard
+# ---------------------------------------------------------------------------
+
+class TestDashboard:
+
+    def test_dashboard_serves_html(self, client):
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+
+    def test_dashboard_contains_driftctl(self, client):
+        resp = client.get("/")
+        assert "driftctl" in resp.text.lower()
+
+    def test_dashboard_has_scan_history_view(self, client):
+        resp = client.get("/")
+        assert "Scan History" in resp.text
+
+    def test_dashboard_has_trends_view(self, client):
+        resp = client.get("/")
+        assert "Trends" in resp.text
+
+    def test_dashboard_has_remediation_marker(self, client):
+        """Dashboard must include the remediation drill-down feature."""
+        resp = client.get("/")
+        assert "Remediation" in resp.text
