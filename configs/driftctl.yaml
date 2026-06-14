@@ -1,0 +1,38 @@
+# driftctl configuration
+# See SPEC.md Section 16 for full reference.
+
+# SQLite database path
+database: driftctl.db
+
+# REST API settings
+api:
+  addr: ":8080"
+  api_key: ""            # set to enable X-API-Key auth; leave empty to disable
+
+# Default AWS settings (overridden per-workspace or by CLI flag)
+default_region: us-east-1
+default_profile: ""      # AWS named profile; empty = use default credential chain
+
+# Default scan settings
+scan:
+  detect_unmanaged: false
+
+# Workspaces
+workspaces:
+  - name: local-dev
+    provider: aws
+    state:
+      backend: local
+      path: ./terraform.tfstate
+    regions: [us-east-1]
+
+  - name: prod
+    provider: aws
+    state:
+      backend: s3
+      bucket: my-tf-state-bucket
+      key: prod/terraform.tfstate
+      region: us-east-1
+    regions: [us-east-1]
+    schedule:
+      cron: "0 6 * * *"
