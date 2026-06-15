@@ -82,19 +82,24 @@ def _connect_sqlite() -> sqlite3.Connection:
 def _connect_turso() -> sqlite3.Connection:
     """
     Open a Turso (cloud SQLite) connection via libsql-client.
-    Returns a connection that is API-compatible with sqlite3.Connection.
+    Falls back to local SQLite if libsql-client is not installed.
     """
-    import libsql_client
+    try:
+        import libsql_client
+    except ImportError:
+        logger.warning(
+            "libsql-client not installed, falling back to local SQLite. "
+            "Install with: pip install libsql-client"
+        )
+        return _connect_sqlite()
 
     url   = os.environ["TURSO_DATABASE_URL"]
     token = os.environ["TURSO_AUTH_TOKEN"]
 
-    # libsql-client uses sync wrapper around async client
     conn = libsql_client.connect(url=url, auth_token=token)
-
-    # Wrap to match sqlite3.Row behaviour
     conn.row_factory = _turso_row_factory
     _ensure_schema(conn)
+    logger.info("Connected to Turso database: %s", url)
     return conn
 
 

@@ -6,6 +6,9 @@ WORKDIR /app
 COPY . .
 RUN pip install --no-cache-dir .
 
+# Install Turso client separately — optional, failure is non-fatal
+RUN pip install --no-cache-dir libsql-client || echo "libsql-client not available, using SQLite"
+
 # Create writable directory for SQLite database
 RUN mkdir -p /data && chown driftctl:driftctl /data
 

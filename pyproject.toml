@@ -15,7 +15,7 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "apscheduler",
-    "libsql-client",
+
 ]
 
 [project.scripts]
