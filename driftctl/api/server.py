@@ -80,9 +80,34 @@ def _seed_demo_workspace() -> None:
     from pathlib import Path
     from driftctl.storage.db import get_workspace_by_name, save_workspace
 
-    # Already exists — don't recreate
-    if get_workspace_by_name("demo"):
-        return
+    # If demo workspace exists but points to deleted S3 bucket, reset it
+    existing = get_workspace_by_name("demo")
+    if existing:
+        state_path = existing.get("state_path", "")
+        # If it's pointing to S3 (deleted bucket), delete and re-seed
+        if state_path.startswith("s3://"):
+            import sqlite3 as _sq
+            try:
+                from driftctl.storage.db import _connect
+                with _connect() as conn:
+                    conn.execute(
+                        "DELETE FROM drift_results WHERE scan_id IN "
+                        "(SELECT id FROM scans WHERE workspace_id = "
+                        "(SELECT id FROM workspaces WHERE name = 'demo'))"
+                    )
+                    conn.execute(
+                        "DELETE FROM scans WHERE workspace_id = "
+                        "(SELECT id FROM workspaces WHERE name = 'demo')"
+                    )
+                    conn.execute(
+                        "DELETE FROM workspaces WHERE name = 'demo'"
+                    )
+                logger.info("Removed stale S3 demo workspace, will re-seed")
+            except Exception as exc:
+                logger.warning("Could not remove stale demo workspace: %s", exc)
+                return
+        else:
+            return  # already seeded correctly
 
     bucket = os.environ.get("DEMO_STATE_BUCKET", "")
     key    = os.environ.get("DEMO_STATE_KEY", "")
