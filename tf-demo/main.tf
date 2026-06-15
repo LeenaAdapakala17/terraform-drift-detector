@@ -1,3 +1,11 @@
+terraform {
+  backend "s3" {
+    bucket = "driftctl-tfstate-leena-demo"
+    key    = "demo/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
 provider "aws" {
   region = "us-east-1"
 }

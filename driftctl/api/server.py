@@ -59,9 +59,11 @@ async def _lifespan(app: FastAPI):
 
 def _seed_demo_workspace() -> None:
     """
-    Create a demo workspace on first startup using the bundled sample.tfstate.
-    This lets anyone visiting the deployed app click Scan Now immediately.
-    Uses skip-cloud mode so no AWS credentials are needed for the demo.
+    Create a demo workspace on first startup.
+
+    If DEMO_STATE_BUCKET and DEMO_STATE_KEY env vars are set,
+    uses the real S3 tfstate for live AWS drift detection.
+    Otherwise falls back to the bundled sample.tfstate with skip-cloud mode.
     """
     import os
     from pathlib import Path
@@ -71,50 +73,63 @@ def _seed_demo_workspace() -> None:
     if get_workspace_by_name("demo"):
         return
 
-    # Find the sample tfstate bundled with the app
-    possible_paths = [
-        Path(__file__).parent.parent.parent / "testdata" / "sample.tfstate",
-        Path("/app/testdata/sample.tfstate"),
-        Path("testdata/sample.tfstate"),
-    ]
-    state_path = None
-    for p in possible_paths:
-        if p.exists():
-            state_path = str(p)
-            break
+    bucket = os.environ.get("DEMO_STATE_BUCKET", "")
+    key    = os.environ.get("DEMO_STATE_KEY", "")
 
-    if not state_path:
-        logger.warning("sample.tfstate not found, skipping demo workspace creation")
-        return
+    if bucket and key:
+        # Use real S3 state — live drift detection
+        state_path   = f"s3://{bucket}/{key}"
+        state_backend = "s3"
+        skip_cloud   = False
+        logger.info("Demo workspace using S3 state: %s", state_path)
+    else:
+        # Fall back to bundled sample.tfstate — skip-cloud mode
+        possible_paths = [
+            Path(__file__).parent.parent.parent / "testdata" / "sample.tfstate",
+            Path("/app/testdata/sample.tfstate"),
+            Path("testdata/sample.tfstate"),
+        ]
+        state_path = None
+        for p in possible_paths:
+            if p.exists():
+                state_path = str(p)
+                break
+        if not state_path:
+            logger.warning("sample.tfstate not found, skipping demo workspace")
+            return
+        state_backend = "local"
+        skip_cloud   = True
+        logger.info("Demo workspace using local sample state: %s", state_path)
 
     save_workspace(
         name="demo",
         state_path=state_path,
         region="us-east-1",
-        state_backend="local",
+        state_backend=state_backend,
         detect_unmanaged=False,
     )
-    logger.info("Demo workspace created with state: %s", state_path)
+    logger.info("Demo workspace created")
 
-    # Run an initial demo scan immediately (skip-cloud so no AWS needed)
+    # Run an initial scan immediately
     try:
-        _run_demo_scan(state_path)
+        _run_demo_scan(state_path, skip_cloud=skip_cloud)
     except Exception as exc:
         logger.warning("Initial demo scan failed: %s", exc)
 
 
-def _run_demo_scan(state_path: str) -> None:
-    """Run a skip-cloud scan against the sample tfstate and save results."""
+def _run_demo_scan(state_path: str, skip_cloud: bool = False) -> None:
+    """Run an initial scan for the demo workspace on startup."""
     import uuid
     from datetime import datetime, timezone
     from driftctl.engine.drift import detect_drift
     from driftctl.engine.remediate import enrich_results
     from driftctl.models import ScanReport
+    from driftctl.providers.registry import DefaultRegistry
     from driftctl.state.extractor import extract_from_state
     from driftctl.state.reader import read_state
     from driftctl.storage.db import save_scan
 
-    raw_records = read_state(state_path)
+    raw_records = read_state(state_path, region="us-east-1")
     expected = [
         r for r in (
             extract_from_state(rec["type"], rec["name"], rec["attributes"])
@@ -123,9 +138,21 @@ def _run_demo_scan(state_path: str) -> None:
         if r is not None
     ]
 
-    # skip-cloud: actual = [] so all resources show as MISSING
-    # This demonstrates the tool working without needing AWS credentials
-    results = detect_drift(expected, [], detect_unmanaged=False)
+    if skip_cloud:
+        actual = []
+    else:
+        try:
+            provider = DefaultRegistry(region="us-east-1").get("aws")
+            actual = []
+            if provider:
+                resource_types = list({r.type for r in expected})
+                for rt in resource_types:
+                    actual.extend(provider.fetch(rt))
+        except Exception as exc:
+            logger.warning("Cloud fetch failed, using empty actual: %s", exc)
+            actual = []
+
+    results = detect_drift(expected, actual, detect_unmanaged=False)
     enrich_results(results)
 
     report = ScanReport(
@@ -137,7 +164,7 @@ def _run_demo_scan(state_path: str) -> None:
         results=results,
     )
     save_scan(report)
-    logger.info("Demo scan complete: %d results", len(results))
+    logger.info("Demo scan complete: %d drifted", report.drifted_count)
 
 
 def create_app(api_key: str = "") -> FastAPI:
