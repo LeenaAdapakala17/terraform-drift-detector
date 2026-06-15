@@ -4,12 +4,8 @@ RUN useradd -m driftctl
 WORKDIR /app
 
 COPY . .
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . psycopg2-binary
 
-# Install Turso client separately — optional, failure is non-fatal
-RUN pip install --no-cache-dir libsql-client || echo "libsql-client not available, using SQLite"
-
-# Create writable directory for SQLite database
 RUN mkdir -p /data && chown driftctl:driftctl /data
 
 USER driftctl

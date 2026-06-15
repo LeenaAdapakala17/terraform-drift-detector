@@ -3,16 +3,13 @@ driftctl/storage/db.py
 
 Persistence layer — supports two backends:
 
-1. SQLite (default) — local file, stdlib sqlite3
-   Used when TURSO_DATABASE_URL is NOT set.
-   Database file: driftctl.db (configurable via DRIFTCTL_DB env var).
+1. PostgreSQL (cloud) — used when DATABASE_URL env var is set.
+   Free tier on Render. Persists forever across restarts and redeploys.
+   Requires: psycopg2-binary
 
-2. Turso (cloud SQLite) — used when TURSO_DATABASE_URL + TURSO_AUTH_TOKEN
-   are set as environment variables.
-   Free tier: 500MB, survives Render restarts.
-   Install: pip install libsql-client
-
-Schema is identical for both backends.
+2. SQLite (default) — local file, stdlib sqlite3.
+   Used when DATABASE_URL is NOT set.
+   Database file configured via DRIFTCTL_DB env var (default: driftctl.db).
 """
 
 from __future__ import annotations
@@ -22,23 +19,18 @@ import logging
 import os
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 
 from driftctl.models import DriftResult, ScanReport
 
 logger = logging.getLogger(__name__)
 
-# Default database path — can be overridden via DRIFTCTL_DB env var
 _DEFAULT_DB = "driftctl.db"
 _db_path: str = _DEFAULT_DB
 
-# Turso connection cache
-_turso_client = None
-
 
 def set_db_path(path: str) -> None:
-    """Override the database file path (called by config loader)."""
     global _db_path
     _db_path = path
 
@@ -47,121 +39,203 @@ def get_db_path() -> str:
     return _db_path
 
 
-def _is_turso() -> bool:
-    """Return True when Turso env vars are configured."""
-    return bool(
-        os.environ.get("TURSO_DATABASE_URL") and
-        os.environ.get("TURSO_AUTH_TOKEN")
-    )
+def _database_url() -> str | None:
+    return os.environ.get("DATABASE_URL")
+
+
+def _is_postgres() -> bool:
+    return bool(_database_url())
 
 
 # ---------------------------------------------------------------------------
-# Connection + schema
+# Connection context manager
 # ---------------------------------------------------------------------------
 
-def _connect() -> sqlite3.Connection:
+class _Connection:
     """
-    Open a database connection.
-    Uses Turso when env vars are set, otherwise local SQLite.
+    Unified connection wrapper for SQLite and PostgreSQL.
+    Used as: with _connect() as conn: ...
+    Supports execute(), fetchall(), fetchone(), commit().
     """
-    if _is_turso():
-        return _connect_turso()
-    return _connect_sqlite()
+
+    def __init__(self, pg_conn=None, sq_conn=None):
+        self._pg = pg_conn
+        self._sq = sq_conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *args):
+        try:
+            if exc_type is None:
+                self.commit()
+        finally:
+            self.close()
+
+    def execute(self, sql: str, params: tuple = ()):
+        if self._pg:
+            import psycopg2.extras
+            cur = self._pg.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor
+            )
+            cur.execute(sql.replace("?", "%s"), params)
+            return _PgCursor(cur)
+        else:
+            return self._sq.execute(sql, params)
+
+    def executescript(self, sql: str):
+        if self._sq:
+            self._sq.executescript(sql)
+
+    def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
+        if self._pg:
+            import psycopg2.extras
+            cur = self._pg.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor
+            )
+            cur.execute(sql.replace("?", "%s"), params)
+            rows = cur.fetchall()
+            cur.close()
+            return [dict(r) for r in rows]
+        else:
+            rows = self._sq.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def fetchone(self, sql: str, params: tuple = ()) -> dict | None:
+        rows = self.fetchall(sql, params)
+        return rows[0] if rows else None
+
+    def commit(self):
+        if self._pg:
+            self._pg.commit()
+        elif self._sq:
+            self._sq.commit()
+
+    def close(self):
+        try:
+            if self._pg:
+                self._pg.close()
+            elif self._sq:
+                self._sq.close()
+        except Exception:
+            pass
 
 
-def _connect_sqlite() -> sqlite3.Connection:
-    """Open a local SQLite connection."""
+class _PgCursor:
+    """Minimal cursor wrapper so execute() return value isn't used."""
+    def __init__(self, cur):
+        self._cur = cur
+        self.rowcount = cur.rowcount
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+
+def _connect() -> _Connection:
+    """Open a database connection (PostgreSQL or SQLite)."""
+    if _is_postgres():
+        return _pg_connect()
+    return _sqlite_connect()
+
+
+def _sqlite_connect() -> _Connection:
     conn = sqlite3.connect(_db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    _ensure_schema(conn)
-    return conn
+    c = _Connection(sq_conn=conn)
+    _ensure_schema(c)
+    return c
 
 
-def _connect_turso() -> sqlite3.Connection:
-    """
-    Open a Turso (cloud SQLite) connection via libsql-client.
-    Falls back to local SQLite if libsql-client is not installed.
-    """
+def _pg_connect() -> _Connection:
     try:
-        import libsql_client
+        import psycopg2
     except ImportError:
-        logger.warning(
-            "libsql-client not installed, falling back to local SQLite. "
-            "Install with: pip install libsql-client"
-        )
-        return _connect_sqlite()
-
-    url   = os.environ["TURSO_DATABASE_URL"]
-    token = os.environ["TURSO_AUTH_TOKEN"]
-
-    conn = libsql_client.connect(url=url, auth_token=token)
-    conn.row_factory = _turso_row_factory
-    _ensure_schema(conn)
-    logger.info("Connected to Turso database: %s", url)
-    return conn
+        logger.error("psycopg2 not installed. Run: pip install psycopg2-binary")
+        raise
+    url = _database_url()
+    pg = psycopg2.connect(url)
+    c = _Connection(pg_conn=pg)
+    _ensure_schema(c)
+    return c
 
 
-def _turso_row_factory(cursor, row):
-    """Make Turso rows behave like sqlite3.Row (subscriptable by name)."""
-    if hasattr(cursor, "description") and cursor.description:
-        return dict(zip([d[0] for d in cursor.description], row))
-    return row
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+def _ensure_schema(conn: _Connection) -> None:
+    if _is_postgres():
+        _ensure_schema_pg(conn)
+    else:
+        _ensure_schema_sqlite(conn)
 
 
-def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create tables and indexes if they don't exist yet."""
+def _ensure_schema_sqlite(conn: _Connection) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS workspaces (
-            id                TEXT PRIMARY KEY,
-            name              TEXT NOT NULL UNIQUE,
-            provider          TEXT NOT NULL DEFAULT 'aws',
-            state_backend     TEXT NOT NULL DEFAULT 'local',
-            state_path        TEXT NOT NULL,
-            state_region      TEXT,
-            region            TEXT NOT NULL,
-            detect_unmanaged  INTEGER NOT NULL DEFAULT 0,
-            schedule_cron     TEXT,
-            created_at        TEXT NOT NULL,
-            last_scan_id      TEXT
+            id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            provider TEXT NOT NULL DEFAULT 'aws',
+            state_backend TEXT NOT NULL DEFAULT 'local',
+            state_path TEXT NOT NULL, state_region TEXT,
+            region TEXT NOT NULL, detect_unmanaged INTEGER NOT NULL DEFAULT 0,
+            schedule_cron TEXT, created_at TEXT NOT NULL, last_scan_id TEXT
         );
-
         CREATE TABLE IF NOT EXISTS scans (
-            id                TEXT PRIMARY KEY,
-            workspace_id      TEXT,
-            created_at        TEXT NOT NULL,
-            state_path        TEXT NOT NULL,
-            region            TEXT NOT NULL,
-            status            TEXT NOT NULL DEFAULT 'complete',
-            drifted_count     INTEGER,
-            total_resources   INTEGER,
-            exit_code         INTEGER,
-            error_message     TEXT,
-            summary_json      TEXT,
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
+            id TEXT PRIMARY KEY, workspace_id TEXT, created_at TEXT NOT NULL,
+            state_path TEXT NOT NULL, region TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'complete',
+            drifted_count INTEGER, total_resources INTEGER,
+            exit_code INTEGER, error_message TEXT, summary_json TEXT
         );
-
         CREATE TABLE IF NOT EXISTS drift_results (
-            id                TEXT PRIMARY KEY,
-            scan_id           TEXT NOT NULL,
-            type              TEXT NOT NULL,
-            resource_id       TEXT NOT NULL,
-            resource_name     TEXT,
-            status            TEXT NOT NULL,
-            attribute_diffs   TEXT NOT NULL,
-            tag_diffs         TEXT NOT NULL,
-            remediation       TEXT,
-            FOREIGN KEY (scan_id) REFERENCES scans(id)
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL,
+            type TEXT NOT NULL, resource_id TEXT NOT NULL,
+            resource_name TEXT, status TEXT NOT NULL,
+            attribute_diffs TEXT NOT NULL, tag_diffs TEXT NOT NULL,
+            remediation TEXT
         );
-
-        CREATE INDEX IF NOT EXISTS idx_scans_workspace
-            ON scans(workspace_id);
-        CREATE INDEX IF NOT EXISTS idx_scans_created
-            ON scans(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_results_scan
-            ON drift_results(scan_id);
+        CREATE INDEX IF NOT EXISTS idx_scans_workspace ON scans(workspace_id);
+        CREATE INDEX IF NOT EXISTS idx_scans_created ON scans(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_results_scan ON drift_results(scan_id);
     """)
+    conn.commit()
+
+
+def _ensure_schema_pg(conn: _Connection) -> None:
+    stmts = [
+        """CREATE TABLE IF NOT EXISTS workspaces (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            provider TEXT NOT NULL DEFAULT 'aws',
+            state_backend TEXT NOT NULL DEFAULT 'local',
+            state_path TEXT NOT NULL, state_region TEXT,
+            region TEXT NOT NULL, detect_unmanaged INTEGER NOT NULL DEFAULT 0,
+            schedule_cron TEXT, created_at TEXT NOT NULL, last_scan_id TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS scans (
+            id TEXT PRIMARY KEY, workspace_id TEXT, created_at TEXT NOT NULL,
+            state_path TEXT NOT NULL, region TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'complete',
+            drifted_count INTEGER, total_resources INTEGER,
+            exit_code INTEGER, error_message TEXT, summary_json TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS drift_results (
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL,
+            type TEXT NOT NULL, resource_id TEXT NOT NULL,
+            resource_name TEXT, status TEXT NOT NULL,
+            attribute_diffs TEXT NOT NULL, tag_diffs TEXT NOT NULL,
+            remediation TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_scans_workspace ON scans(workspace_id)",
+        "CREATE INDEX IF NOT EXISTS idx_scans_created ON scans(created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_results_scan ON drift_results(scan_id)",
+    ]
+    for stmt in stmts:
+        conn.execute(stmt)
     conn.commit()
 
 
@@ -170,104 +244,101 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 def save_scan(report: ScanReport) -> None:
-    """
-    Persist a ScanReport to SQLite.
-    Saves the scan header row and all drift_results rows.
-    """
+    """Persist a ScanReport to the database."""
     with _connect() as conn:
-        # Resolve workspace_id if report has a workspace name
         workspace_id = None
         if report.workspace:
-            row = conn.execute(
+            row = conn.fetchone(
                 "SELECT id FROM workspaces WHERE name = ?",
-                (report.workspace,),
-            ).fetchone()
+                (report.workspace,))
             if row:
                 workspace_id = row["id"]
 
         summary = report.summary()
 
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO scans
-              (id, workspace_id, created_at, state_path, region,
-               status, drifted_count, total_resources, exit_code, summary_json)
-            VALUES (?, ?, ?, ?, ?, 'complete', ?, ?, ?, ?)
-            """,
-            (
-                report.scan_id,
-                workspace_id,
-                report.created_at,
-                report.state_path,
-                report.region,
-                summary["drifted"],
-                summary["total_resources"],
-                report.exit_code,
-                json.dumps(summary),
-            ),
-        )
+        if _is_postgres():
+            conn.execute("""
+                INSERT INTO scans
+                  (id, workspace_id, created_at, state_path, region,
+                   status, drifted_count, total_resources, exit_code, summary_json)
+                VALUES (?, ?, ?, ?, ?, 'complete', ?, ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                  status='complete',
+                  drifted_count=EXCLUDED.drifted_count,
+                  total_resources=EXCLUDED.total_resources,
+                  exit_code=EXCLUDED.exit_code,
+                  summary_json=EXCLUDED.summary_json
+            """, (
+                report.scan_id, workspace_id, report.created_at,
+                report.state_path, report.region,
+                summary["drifted"], summary["total_resources"],
+                report.exit_code, json.dumps(summary),
+            ))
+        else:
+            conn.execute("""
+                INSERT OR REPLACE INTO scans
+                  (id, workspace_id, created_at, state_path, region,
+                   status, drifted_count, total_resources, exit_code, summary_json)
+                VALUES (?, ?, ?, ?, ?, 'complete', ?, ?, ?, ?)
+            """, (
+                report.scan_id, workspace_id, report.created_at,
+                report.state_path, report.region,
+                summary["drifted"], summary["total_resources"],
+                report.exit_code, json.dumps(summary),
+            ))
 
-        # Save individual drift results
         for result in report.results:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO drift_results
-                  (id, scan_id, type, resource_id, resource_name,
-                   status, attribute_diffs, tag_diffs, remediation)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    report.scan_id,
-                    result.type,
-                    result.id,
-                    result.name,
+            rid = str(uuid.uuid4())
+            if _is_postgres():
+                conn.execute("""
+                    INSERT INTO drift_results
+                      (id, scan_id, type, resource_id, resource_name,
+                       status, attribute_diffs, tag_diffs, remediation)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (id) DO NOTHING
+                """, (
+                    rid, report.scan_id, result.type, result.id, result.name,
                     result.status,
                     json.dumps(_serialise_diffs(result.attribute_diffs)),
-                    json.dumps(result.tag_diffs),
-                    result.remediation,
-                ),
-            )
+                    json.dumps(result.tag_diffs), result.remediation,
+                ))
+            else:
+                conn.execute("""
+                    INSERT OR IGNORE INTO drift_results
+                      (id, scan_id, type, resource_id, resource_name,
+                       status, attribute_diffs, tag_diffs, remediation)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    rid, report.scan_id, result.type, result.id, result.name,
+                    result.status,
+                    json.dumps(_serialise_diffs(result.attribute_diffs)),
+                    json.dumps(result.tag_diffs), result.remediation,
+                ))
 
-        # Update workspace last_scan_id
         if workspace_id:
             conn.execute(
                 "UPDATE workspaces SET last_scan_id = ? WHERE id = ?",
-                (report.scan_id, workspace_id),
-            )
+                (report.scan_id, workspace_id))
 
-        conn.commit()
-    logger.info("Saved scan %s to %s", report.scan_id, _db_path)
+    logger.info("Saved scan %s", report.scan_id)
 
 
 def get_scan(scan_id: str) -> ScanReport | None:
-    """
-    Load a ScanReport from SQLite by scan_id.
-    Returns None if not found.
-    """
+    """Load a ScanReport from the database by scan_id."""
     with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM scans WHERE id = ?", (scan_id,)
-        ).fetchone()
+        row = conn.fetchone("SELECT * FROM scans WHERE id = ?", (scan_id,))
         if not row:
             return None
-
-        result_rows = conn.execute(
-            "SELECT * FROM drift_results WHERE scan_id = ? ORDER BY rowid",
-            (scan_id,),
-        ).fetchall()
-
-        # Resolve workspace name
+        result_rows = conn.fetchall(
+            "SELECT * FROM drift_results WHERE scan_id = ? ORDER BY id",
+            (scan_id,))
         workspace_name = None
-        if row["workspace_id"]:
-            ws_row = conn.execute(
+        if row.get("workspace_id"):
+            ws = conn.fetchone(
                 "SELECT name FROM workspaces WHERE id = ?",
-                (row["workspace_id"],),
-            ).fetchone()
-            if ws_row:
-                workspace_name = ws_row["name"]
-
-    results = [_row_to_drift_result(r) for r in result_rows]
+                (row["workspace_id"],))
+            if ws:
+                workspace_name = ws["name"]
 
     return ScanReport(
         scan_id=row["id"],
@@ -275,64 +346,48 @@ def get_scan(scan_id: str) -> ScanReport | None:
         state_path=row["state_path"],
         region=row["region"],
         workspace=workspace_name,
-        results=results,
+        results=[_row_to_drift_result(r) for r in result_rows],
     )
 
 
-def list_scans(
-    workspace: str | None = None,
-    limit: int = 20,
-) -> list[dict]:
-    """
-    List recent scans, newest first.
-    Optionally filter by workspace name.
-    """
+def list_scans(workspace: str | None = None, limit: int = 20) -> list[dict]:
+    """List recent scans, newest first."""
     with _connect() as conn:
         if workspace:
-            ws_row = conn.execute(
-                "SELECT id FROM workspaces WHERE name = ?", (workspace,)
-            ).fetchone()
-            ws_id = ws_row["id"] if ws_row else None
-            rows = conn.execute(
-                """
+            ws = conn.fetchone(
+                "SELECT id FROM workspaces WHERE name = ?", (workspace,))
+            ws_id = ws["id"] if ws else None
+            rows = conn.fetchall("""
                 SELECT s.id, s.created_at, s.state_path, s.region,
                        s.drifted_count, s.total_resources, s.exit_code,
-                       w.name as workspace_name
+                       s.status, s.summary_json, w.name as workspace_name
                 FROM scans s
                 LEFT JOIN workspaces w ON s.workspace_id = w.id
                 WHERE s.workspace_id = ?
-                ORDER BY s.created_at DESC
-                LIMIT ?
-                """,
-                (ws_id, limit),
-            ).fetchall()
+                ORDER BY s.created_at DESC LIMIT ?
+            """, (ws_id, limit))
         else:
-            rows = conn.execute(
-                """
+            rows = conn.fetchall("""
                 SELECT s.id, s.created_at, s.state_path, s.region,
                        s.drifted_count, s.total_resources, s.exit_code,
-                       w.name as workspace_name
+                       s.status, s.summary_json, w.name as workspace_name
                 FROM scans s
                 LEFT JOIN workspaces w ON s.workspace_id = w.id
-                ORDER BY s.created_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+                ORDER BY s.created_at DESC LIMIT ?
+            """, (limit,))
 
-    return [
-        {
-            "scan_id":         r["id"],
-            "created_at":      r["created_at"],
-            "state_path":      r["state_path"],
-            "region":          r["region"],
-            "workspace":       r["workspace_name"],
-            "drifted_count":   r["drifted_count"],
-            "total_resources": r["total_resources"],
-            "exit_code":       r["exit_code"],
-        }
-        for r in rows
-    ]
+    return [{
+        "scan_id":         r["id"],
+        "created_at":      r["created_at"],
+        "state_path":      r["state_path"],
+        "region":          r["region"],
+        "workspace":       r.get("workspace_name"),
+        "drifted_count":   r["drifted_count"],
+        "total_resources": r["total_resources"],
+        "exit_code":       r["exit_code"],
+        "status":          r.get("status", "complete"),
+        "summary_json":    r.get("summary_json"),
+    } for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -340,124 +395,84 @@ def list_scans(
 # ---------------------------------------------------------------------------
 
 def save_workspace(
-    name: str,
-    state_path: str,
-    region: str,
-    state_backend: str = "local",
-    state_region: str | None = None,
-    detect_unmanaged: bool = False,
-    schedule_cron: str | None = None,
+    name: str, state_path: str, region: str,
+    state_backend: str = "local", state_region: str | None = None,
+    detect_unmanaged: bool = False, schedule_cron: str | None = None,
     provider: str = "aws",
 ) -> str:
-    """
-    Insert or update a workspace. Returns the workspace id.
-    """
+    """Insert or update a workspace. Returns the workspace id."""
     with _connect() as conn:
-        existing = conn.execute(
-            "SELECT id FROM workspaces WHERE name = ?", (name,)
-        ).fetchone()
-
+        existing = conn.fetchone(
+            "SELECT id FROM workspaces WHERE name = ?", (name,))
         if existing:
             ws_id = existing["id"]
-            conn.execute(
-                """
+            conn.execute("""
                 UPDATE workspaces
-                SET state_path = ?, region = ?, state_backend = ?,
-                    state_region = ?, detect_unmanaged = ?,
-                    schedule_cron = ?, provider = ?
-                WHERE id = ?
-                """,
-                (
-                    state_path, region, state_backend,
-                    state_region, int(detect_unmanaged),
-                    schedule_cron, provider, ws_id,
-                ),
-            )
+                SET state_path=?, region=?, state_backend=?,
+                    state_region=?, detect_unmanaged=?,
+                    schedule_cron=?, provider=?
+                WHERE id=?
+            """, (state_path, region, state_backend, state_region,
+                  int(detect_unmanaged), schedule_cron, provider, ws_id))
         else:
             ws_id = str(uuid.uuid4())
-            conn.execute(
-                """
+            conn.execute("""
                 INSERT INTO workspaces
                   (id, name, provider, state_backend, state_path,
                    state_region, region, detect_unmanaged,
                    schedule_cron, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ws_id, name, provider, state_backend, state_path,
-                    state_region, region, int(detect_unmanaged),
-                    schedule_cron,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
-        conn.commit()
+            """, (ws_id, name, provider, state_backend, state_path,
+                  state_region, region, int(detect_unmanaged),
+                  schedule_cron, datetime.now(timezone.utc).isoformat()))
     return ws_id
 
 
 def list_workspaces() -> list[dict]:
-    """Return all workspaces as a list of dicts."""
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM workspaces ORDER BY name"
-        ).fetchall()
-    return [dict(r) for r in rows]
+        return conn.fetchall("SELECT * FROM workspaces ORDER BY name")
 
 
 def get_workspace_by_name(name: str) -> dict | None:
-    """Return a workspace dict by name, or None."""
     with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM workspaces WHERE name = ?", (name,)
-        ).fetchone()
-    return dict(row) if row else None
+        return conn.fetchone(
+            "SELECT * FROM workspaces WHERE name = ?", (name,))
 
 
 def update_schedule(workspace_name: str, cron: str) -> bool:
-    """
-    Update the cron schedule for a workspace.
-    Returns True if the workspace was found and updated.
-    """
     with _connect() as conn:
-        cursor = conn.execute(
+        existing = conn.fetchone(
+            "SELECT id FROM workspaces WHERE name = ?", (workspace_name,))
+        if not existing:
+            return False
+        conn.execute(
             "UPDATE workspaces SET schedule_cron = ? WHERE name = ?",
-            (cron, workspace_name),
-        )
-        conn.commit()
-    return cursor.rowcount > 0
+            (cron, workspace_name))
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
-def _row_to_drift_result(row: sqlite3.Row) -> DriftResult:
-    """Reconstruct a DriftResult from a drift_results table row."""
+def _row_to_drift_result(row: dict) -> DriftResult:
     try:
-        attr_diffs = json.loads(row["attribute_diffs"] or "{}")
+        attr_diffs = json.loads(row.get("attribute_diffs") or "{}")
     except json.JSONDecodeError:
         attr_diffs = {}
-
     try:
-        tag_diffs = json.loads(row["tag_diffs"] or "{}")
+        tag_diffs = json.loads(row.get("tag_diffs") or "{}")
     except json.JSONDecodeError:
         tag_diffs = {}
-
     return DriftResult(
-        type=row["type"],
-        id=row["resource_id"],
-        name=row["resource_name"],
-        status=row["status"],
-        attribute_diffs=attr_diffs,
-        tag_diffs=tag_diffs,
-        remediation=row["remediation"],
+        type=row["type"], id=row["resource_id"],
+        name=row.get("resource_name"), status=row["status"],
+        attribute_diffs=attr_diffs, tag_diffs=tag_diffs,
+        remediation=row.get("remediation"),
     )
 
 
 def _serialise_diffs(diffs: dict) -> dict:
-    """
-    Convert attribute_diffs to a JSON-safe dict.
-    SGRule dataclasses and similar non-JSON types are converted to strings.
-    """
     result = {}
     for field, diff in diffs.items():
         result[field] = {
@@ -468,7 +483,6 @@ def _serialise_diffs(diffs: dict) -> dict:
 
 
 def _to_json_safe(value: object) -> object:
-    """Recursively make a value JSON-serialisable."""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, (list, tuple)):
