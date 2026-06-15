@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "driftctl"
 version = "1.0.0"
-description = "Terraform drift detector"
+description = "Terraform drift detector — compares state files against live AWS infrastructure"
 requires-python = ">=3.11"
 dependencies = [
     "boto3",
@@ -15,6 +15,7 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "apscheduler",
+    "libsql-client",
 ]
 
 [project.scripts]
@@ -29,11 +30,20 @@ dev = [
     "moto[ec2,s3]",
     "httpx",
     "pre-commit",
+    "boto3-stubs[ec2,s3]",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["driftctl*"]
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

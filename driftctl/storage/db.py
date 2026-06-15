@@ -1,22 +1,25 @@
 """
 driftctl/storage/db.py
 
-SQLite persistence layer.
+Persistence layer — supports two backends:
 
-Schema:
-  workspaces    — named scan configurations
-  scans         — one row per scan run
-  drift_results — one row per resource per scan
+1. SQLite (default) — local file, stdlib sqlite3
+   Used when TURSO_DATABASE_URL is NOT set.
+   Database file: driftctl.db (configurable via DRIFTCTL_DB env var).
 
-Uses stdlib sqlite3 only — no ORM, no external dependency.
-Database file: driftctl.db (configurable via config.yaml).
-Schema is created on first connection.
+2. Turso (cloud SQLite) — used when TURSO_DATABASE_URL + TURSO_AUTH_TOKEN
+   are set as environment variables.
+   Free tier: 500MB, survives Render restarts.
+   Install: pip install libsql-client
+
+Schema is identical for both backends.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -26,9 +29,12 @@ from driftctl.models import DriftResult, ScanReport
 
 logger = logging.getLogger(__name__)
 
-# Default database path — can be overridden via config
+# Default database path — can be overridden via DRIFTCTL_DB env var
 _DEFAULT_DB = "driftctl.db"
 _db_path: str = _DEFAULT_DB
+
+# Turso connection cache
+_turso_client = None
 
 
 def set_db_path(path: str) -> None:
@@ -41,18 +47,62 @@ def get_db_path() -> str:
     return _db_path
 
 
+def _is_turso() -> bool:
+    """Return True when Turso env vars are configured."""
+    return bool(
+        os.environ.get("TURSO_DATABASE_URL") and
+        os.environ.get("TURSO_AUTH_TOKEN")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Connection + schema
 # ---------------------------------------------------------------------------
 
 def _connect() -> sqlite3.Connection:
-    """Open a connection and ensure the schema exists."""
+    """
+    Open a database connection.
+    Uses Turso when env vars are set, otherwise local SQLite.
+    """
+    if _is_turso():
+        return _connect_turso()
+    return _connect_sqlite()
+
+
+def _connect_sqlite() -> sqlite3.Connection:
+    """Open a local SQLite connection."""
     conn = sqlite3.connect(_db_path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")   # better concurrency
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _ensure_schema(conn)
     return conn
+
+
+def _connect_turso() -> sqlite3.Connection:
+    """
+    Open a Turso (cloud SQLite) connection via libsql-client.
+    Returns a connection that is API-compatible with sqlite3.Connection.
+    """
+    import libsql_client
+
+    url   = os.environ["TURSO_DATABASE_URL"]
+    token = os.environ["TURSO_AUTH_TOKEN"]
+
+    # libsql-client uses sync wrapper around async client
+    conn = libsql_client.connect(url=url, auth_token=token)
+
+    # Wrap to match sqlite3.Row behaviour
+    conn.row_factory = _turso_row_factory
+    _ensure_schema(conn)
+    return conn
+
+
+def _turso_row_factory(cursor, row):
+    """Make Turso rows behave like sqlite3.Row (subscriptable by name)."""
+    if hasattr(cursor, "description") and cursor.description:
+        return dict(zip([d[0] for d in cursor.description], row))
+    return row
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
