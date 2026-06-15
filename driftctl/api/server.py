@@ -34,6 +34,17 @@ async def _lifespan(app: FastAPI):
     """
     # Startup
     logger.info("driftctl server starting")
+
+    # Respect DRIFTCTL_DB env var for database path
+    import os
+    db_path = os.environ.get("DRIFTCTL_DB", "driftctl.db")
+    try:
+        from driftctl.storage.db import set_db_path
+        set_db_path(db_path)
+        logger.info("Database path: %s", db_path)
+    except Exception as exc:
+        logger.warning("Could not set DB path: %s", exc)
+
     try:
         from driftctl.scheduler.jobs import start_scheduler
         start_scheduler()
