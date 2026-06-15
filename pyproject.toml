@@ -15,7 +15,6 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "apscheduler",
-
 ]
 
 [project.scripts]
@@ -32,6 +31,10 @@ dev = [
     "pre-commit",
     "boto3-stubs[ec2,s3]",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["driftctl*"]
 
 [tool.ruff]
 line-length = 88
